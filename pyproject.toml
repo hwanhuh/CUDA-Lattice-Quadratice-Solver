@@ -11,8 +11,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "lattice-qp"
-version = "0.1.0"
-description = "CUDA-accelerated multiple-rounding solver for sparse convex lattice QPs"
+version = "0.2.0"
+description = "CUDA-accelerated policy-driven solver for sparse convex lattice QPs"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
@@ -46,8 +46,11 @@ wheel.reproducible = true
 sdist.reproducible = true
 sdist.include = [
     "/CMakeLists.txt",
+    "src/*.cpp",
     "src/*.cu",
-    "lattice_qp/*.py",
+    "src/*.cuh",
+    "src/*.hpp",
+    "lattice_qp/**/*.py",
     "benchmarks/*.py",
     "tests/*.py",
 ]

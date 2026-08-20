@@ -1,6 +1,6 @@
 # Lattice-QP
 
-`Lattice-QP` is a CUDA-accelerated relax-and-fix solver for sparse convex lattice quadratic programs:
+`Lattice-QP` is a CUDA-accelerated, policy-driven relax-and-fix solver for sparse convex lattice quadratic programs:
 
 ```math
 \min_x \frac{1}{2}x^T Hx-g^Tx,
@@ -32,6 +32,70 @@ result = solve_lattice_qp(
 print(result.x, result.objective, result.relative_residual)
 ```
 
+Selection and lattice projection are independent. Typed policies make that
+choice explicit while the original string options remain supported:
+
+```python
+from lattice_qp import RoundingPolicy
+
+policy = RoundingPolicy(
+    selection="sequential",       # sequential, multiple, or all
+    projection="away_from_zero", # nearest, floor, ceil, or away_from_zero
+)
+
+result = solve_lattice_qp(
+    H,
+    g,
+    integer_indices=indices,
+    lattice_steps=periods,
+    rounding=policy,
+)
+```
+
+`rounding="multiple"` remains an alias for multiple selection with nearest
+projection. `rounding="greedy"` retains its historical behavior and fixes all
+integer coordinates at once with nearest projection.
+
+## Cone-aware geometry problems
+
+`solve_cone_miq` adds the stateful terminal correction used by cross-field and
+period-jump problems. Cone incidence is evaluated on normalized integer
+coordinates `q[j] = x[integer_indices[j]] / lattice_steps[j]`, not on the
+physical values of `x`:
+
+```python
+from lattice_qp import solve_cone_miq
+
+result = solve_cone_miq(
+    H,
+    g,
+    integer_indices=period_jump_indices,
+    edge_endpoints=edge_cone_pairs,  # (tail cone, head cone) per integer DOF
+    base_cones=base_cone_indices,
+    minimum_cones=minimum_cone_indices,
+    double_cover=False,
+    selection="multiple",
+    backend="auto",
+)
+
+assert result.cone_feasible
+print(result.cone_correction_count, result.cone_max_violation)
+```
+
+Advanced callers can construct `ConeRoundingPolicy` directly from a CSR
+incidence matrix. Each signed integer coefficient contributes `a[c, j] * q[j]`
+to cone row `c`; coefficients such as `+/-2` therefore support double-cover
+formulations without mesh-specific objects in the solver core. Conflicting
+terminal bounds are returned deterministically and exposed through
+`cone_feasible`, `cone_violation_count`, `cone_max_violation`, `cone_values`,
+and `cone_violations` rather than being silently hidden.
+
+This helper solves one already-linear sparse lattice QP. It is not the complete
+nonlinear Penner-coordinate algorithm from [*Seamless Parametrization in Penner
+Coordinates*](https://arxiv.org/abs/2407.21342): callers remain responsible for
+angle/holonomy Jacobian updates, line search, intrinsic flips, and any outer
+Newton iteration.
+
 `block_pairs=None` asks the CUDA backend to form disjoint algebraic 2-by-2 Jacobi blocks
 from mutual strongest off-diagonal couplings.
 Explicit disjoint pairs may be supplied as an `(n, 2)` integer array.
@@ -49,7 +113,7 @@ solve still recomputes an explicit residual, and the public API independently
 verifies the true residual on the host. `result.pcg_host_synchronizations`
 reports the synchronization count for profiling.
 
-The `multiple` policy sorts normalized rounding residues,
+The `multiple` selection policy sorts normalized rounding residues,
 fixes at least one variable and then the largest prefix whose cumulative residue is at most `multiple_rounding_threshold` (default `0.5`),
 and re-solves between batches.
 Intermediate projected solves use tolerance `1e-3` and at most 50 PCG iterations by default.

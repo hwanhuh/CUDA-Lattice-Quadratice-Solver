@@ -98,6 +98,30 @@ def _cpu_fixture() -> tuple[sparse.csr_matrix, np.ndarray, np.ndarray, np.ndarra
     return H, np.asarray(H @ target), integer_indices, periods
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("maximum_iterations", True),
+        ("maximum_iterations", 1.5),
+        ("maximum_iterations", 2**31),
+        ("intermediate_maximum_iterations", False),
+        ("intermediate_maximum_iterations", 1.5),
+        ("intermediate_maximum_iterations", 2**31),
+        ("intermediate_tolerance", 0.0),
+        ("intermediate_tolerance", np.nan),
+        ("intermediate_tolerance", np.inf),
+    ],
+)
+def test_solver_controls_are_backend_independent(option, value) -> None:
+    kwargs = {
+        "integer_indices": np.empty(0, dtype=np.int64),
+        "backend": "cpu",
+        option: value,
+    }
+    with pytest.raises(ValueError, match=option):
+        solve_lattice_qp(sparse.eye(1, format="csr"), np.zeros(1), **kwargs)
+
+
 def test_cpu_rounding_matches_full_scan_reference_and_is_deterministic() -> None:
     H, g, integer_indices, periods = _cpu_fixture()
     reference_x, reference_batches, reference_residual = _reference_rounding(
@@ -170,6 +194,44 @@ def _cuda_fixture() -> tuple[sparse.csr_matrix, np.ndarray, np.ndarray, np.ndarr
     integer_indices = np.array([0, 2, 4, 6, 8, 10], dtype=np.int64)
     periods = np.ones(len(integer_indices), dtype=np.float64)
     return H, np.asarray(H @ target), integer_indices, periods
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA extension/device unavailable")
+def test_cuda_scalar_continuous_problem_matches_cpu() -> None:
+    H = sparse.csr_matrix([[3.0]], dtype=np.float64)
+    g = np.array([6.0], dtype=np.float64)
+    common = dict(
+        integer_indices=np.empty(0, dtype=np.int64),
+        lattice_steps=np.empty(0, dtype=np.float64),
+        x0=np.zeros(1, dtype=np.float64),
+    )
+    cpu = solve_lattice_qp(H, g, backend="cpu", **common)
+    cuda = solve_lattice_qp(H, g, backend="cuda", **common)
+
+    np.testing.assert_allclose(cuda.x, cpu.x, rtol=0.0, atol=1e-14)
+    assert cuda.linear_iterations == 1
+    assert cuda.relative_residual == 0.0
+    assert cuda.converged
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA extension/device unavailable")
+def test_cuda_projected_solve_with_one_free_variable_matches_cpu() -> None:
+    H = sparse.csr_matrix([[2.0, 0.2], [0.2, 3.0]], dtype=np.float64)
+    target = np.array([0.2, 2.0], dtype=np.float64)
+    g = np.asarray(H @ target)
+    common = dict(
+        integer_indices=np.array([0], dtype=np.int64),
+        lattice_steps=np.ones(1, dtype=np.float64),
+        x0=np.zeros(2, dtype=np.float64),
+        tolerance=2e-7,
+    )
+    cpu = solve_lattice_qp(H, g, backend="cpu", **common)
+    cuda = solve_lattice_qp(H, g, backend="cuda", **common)
+
+    np.testing.assert_allclose(cuda.x, cpu.x, rtol=2e-7, atol=2e-7)
+    assert cuda.x[0] == 0.0
+    assert cuda.relative_residual <= 2e-7
+    assert cuda.converged
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="CUDA extension/device unavailable")

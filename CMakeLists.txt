@@ -48,7 +48,14 @@ set(LATTICE_QP_CUDA_ARCHITECTURES
     "70-real;75-real;80-real;86-real;89-real;90-real;90-virtual"
     CACHE STRING "CUDA architectures shipped in the lattice-qp wheel")
 
-pybind11_add_module(_core MODULE src/lattice_qp_cuda.cu)
+pybind11_add_module(_core MODULE
+    src/bindings.cpp
+    src/cuda_kernels.cu
+    src/cuda_system.cu
+    src/matrix_analysis.cpp
+    src/rounding.cpp
+    src/solver.cpp
+)
 set_target_properties(_core PROPERTIES
     CUDA_ARCHITECTURES "${LATTICE_QP_CUDA_ARCHITECTURES}"
     INSTALL_RPATH "$ORIGIN/../nvidia/cublas/lib;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/cusparse/lib"
