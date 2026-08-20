@@ -17,9 +17,33 @@
 
 namespace lattice_qp {
 
-SolverOutput solveLatticeQp(const SolverInput& input,
-    const SolverOptions& options)
+namespace {
+
+std::vector<std::pair<std::int32_t, std::int32_t>> prepareBlockPairs(
+    const std::vector<std::int64_t>& blockPairs64, std::size_t dimension)
 {
+    if (blockPairs64.size() % 2 != 0)
+        throw std::invalid_argument("native array sizes are inconsistent");
+    std::vector<std::pair<std::int32_t, std::int32_t>> blockPairs;
+    blockPairs.reserve(blockPairs64.size() / 2);
+    for (std::size_t offset = 0; offset < blockPairs64.size(); offset += 2) {
+        const std::int64_t first = blockPairs64[offset];
+        const std::int64_t second = blockPairs64[offset + 1];
+        if (first < 0 || second < 0
+            || first >= static_cast<std::int64_t>(dimension)
+            || second >= static_cast<std::int64_t>(dimension)) {
+            throw std::invalid_argument("block pair is out of range");
+        }
+        blockPairs.emplace_back(static_cast<std::int32_t>(first),
+            static_cast<std::int32_t>(second));
+    }
+    return blockPairs;
+}
+
+SolverOutput solveWithCudaSystem(const SolverInput& input,
+    const SolverOptions& options, CudaSystem& system)
+{
+
     const auto& rowOffsets = input.rowOffsets;
     const auto& columnIndices = input.columnIndices;
     const auto& values = input.values;
@@ -27,7 +51,6 @@ SolverOutput solveLatticeQp(const SolverInput& input,
     const auto& integerIndices64 = input.integerIndices;
     const auto& periods = input.periods;
     const auto& initial = input.initial;
-    const auto& blockPairs64 = input.blockPairs;
     const auto& incidenceIndptr = input.incidenceIndptr;
     const auto& incidenceIndices = input.incidenceIndices;
     const auto& incidenceCoefficients = input.incidenceCoefficients;
@@ -49,8 +72,7 @@ SolverOutput solveLatticeQp(const SolverInput& input,
         throw std::invalid_argument("row_offsets is empty");
     const std::size_t dimension = rowOffsets.size() - 1;
     if (linear.size() != dimension || initial.size() != dimension
-        || periods.size() != integerIndices64.size()
-        || blockPairs64.size() % 2 != 0) {
+        || periods.size() != integerIndices64.size()) {
         throw std::invalid_argument("native array sizes are inconsistent");
     }
     if (roundingSelection != "sequential"
@@ -71,19 +93,6 @@ SolverOutput solveLatticeQp(const SolverInput& input,
             throw std::invalid_argument("integer index is out of range");
         integerIndices.push_back(static_cast<std::int32_t>(index));
     }
-    std::vector<std::pair<std::int32_t, std::int32_t>> blockPairs;
-    for (std::size_t offset = 0; offset < blockPairs64.size(); offset += 2) {
-        const std::int64_t first = blockPairs64[offset];
-        const std::int64_t second = blockPairs64[offset + 1];
-        if (first < 0 || second < 0
-            || first >= static_cast<std::int64_t>(dimension)
-            || second >= static_cast<std::int64_t>(dimension)) {
-            throw std::invalid_argument("block pair is out of range");
-        }
-        blockPairs.emplace_back(static_cast<std::int32_t>(first),
-            static_cast<std::int32_t>(second));
-    }
-
     SolverOutput output;
     std::vector<std::uint8_t> fixed(dimension, 0);
     std::vector<double> fixedValues(dimension, 0.0);
@@ -94,7 +103,6 @@ SolverOutput solveLatticeQp(const SolverInput& input,
     bool projectedStateInitialized = false;
     std::size_t fixedVariableCount = 0;
 
-    CudaSystem system(rowOffsets, columnIndices, values, blockPairs);
     ProjectionState projectionState(projection, integerIndices.size(),
         incidenceIndptr, incidenceIndices, incidenceCoefficients,
         baseCones, minimumCones);
@@ -326,6 +334,87 @@ SolverOutput solveLatticeQp(const SolverInput& input,
             output.coneMaxViolation, violation);
     }
     return output;
+}
+
+} // namespace
+
+SolverOutput solveLatticeQp(const SolverInput& input,
+    const SolverOptions& options)
+{
+    if (input.rowOffsets.size() < 2)
+        throw std::invalid_argument("row_offsets is empty");
+    const auto blockPairs = prepareBlockPairs(
+        input.blockPairs, input.rowOffsets.size() - 1);
+    CudaSystem system(input.rowOffsets, input.columnIndices, input.values,
+        blockPairs);
+    return solveWithCudaSystem(input, options, system);
+}
+
+PreparedCudaSolver::PreparedCudaSolver(SolverInput structuralInput)
+    : input_(std::move(structuralInput))
+{
+    if (input_.rowOffsets.size() < 2)
+        throw std::invalid_argument("row_offsets is empty");
+    const std::size_t dimension = input_.rowOffsets.size() - 1;
+    if (input_.periods.size() != input_.integerIndices.size())
+        throw std::invalid_argument("native array sizes are inconsistent");
+    for (std::int64_t index : input_.integerIndices) {
+        if (index < 0 || index >= static_cast<std::int64_t>(dimension))
+            throw std::invalid_argument("integer index is out of range");
+    }
+    const auto blockPairs = prepareBlockPairs(input_.blockPairs, dimension);
+    system_ = std::make_unique<CudaSystem>(input_.rowOffsets,
+        input_.columnIndices, input_.values, blockPairs);
+}
+
+PreparedCudaSolver::~PreparedCudaSolver() = default;
+
+SolverOutput PreparedCudaSolver::solve(std::vector<double> linear,
+    std::vector<double> initial,
+    std::vector<std::int32_t> incidenceIndptr,
+    std::vector<std::int32_t> incidenceIndices,
+    std::vector<std::int64_t> incidenceCoefficients,
+    std::vector<std::int64_t> baseCones,
+    std::vector<std::int64_t> minimumCones,
+    const SolverOptions& options)
+{
+    std::unique_lock<std::mutex> lock(solveMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        throw std::runtime_error(
+            "concurrent solves on one LatticeQPSession are not supported");
+    }
+    ++stats_.solveCalls;
+    if (lifetimeSolveCalls_ != 0)
+        ++stats_.cudaSystemReuses;
+    ++lifetimeSolveCalls_;
+    input_.linear = std::move(linear);
+    input_.initial = std::move(initial);
+    input_.incidenceIndptr = std::move(incidenceIndptr);
+    input_.incidenceIndices = std::move(incidenceIndices);
+    input_.incidenceCoefficients = std::move(incidenceCoefficients);
+    input_.baseCones = std::move(baseCones);
+    input_.minimumCones = std::move(minimumCones);
+    return solveWithCudaSystem(input_, options, *system_);
+}
+
+PreparedCudaSolverStats PreparedCudaSolver::stats() const
+{
+    std::unique_lock<std::mutex> lock(solveMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        throw std::runtime_error(
+            "session statistics are unavailable during a solve");
+    }
+    return stats_;
+}
+
+void PreparedCudaSolver::resetStats()
+{
+    std::unique_lock<std::mutex> lock(solveMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        throw std::runtime_error(
+            "session statistics cannot be reset during a solve");
+    }
+    stats_ = PreparedCudaSolverStats {};
 }
 
 } // namespace lattice_qp

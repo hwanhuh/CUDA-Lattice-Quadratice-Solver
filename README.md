@@ -32,6 +32,46 @@ result = solve_lattice_qp(
 print(result.x, result.objective, result.relative_residual)
 ```
 
+### Reusing a prepared problem
+
+For geometry outer loops that solve the same matrix structure with changing
+right-hand sides, `LatticeQPSession` keeps immutable copies of the normalized
+sparse problem, integer coordinates, lattice steps, and optional block pairs.
+When `backend="cuda"` is selected, it also keeps the native CUDA system alive
+across calls. The per-call solver options match `solve_lattice_qp`; `g` and
+`x0` may change between calls:
+
+```python
+from lattice_qp import LatticeQPSession
+
+with LatticeQPSession(
+    H,
+    integer_indices=indices,
+    lattice_steps=periods,
+    block_pairs=None,
+) as session:
+    first = session.solve(g0, x0=x0, backend="cuda")
+    second = session.solve(g1, x0=first.x, backend="cuda")
+    print(session.stats.solve_calls)
+```
+
+The session is also explicitly closable with an idempotent `close()` method.
+`session.stats` is a read-only snapshot exposing `solve_calls`,
+`cuda_system_creations`, and `cuda_system_reuses`; call `reset_stats()` to
+reset those counters without releasing the prepared resources. A session is
+single-owner and rejects overlapping `solve()` calls.
+
+CUDA sessions reuse the analyzed CSR matrix, block-Jacobi preconditioner,
+device matrix, handles, and PCG work buffers. CPU sessions retain the
+normalized structural inputs but currently rebuild SciPy projected systems
+and preconditioners for each solve.
+
+The session does not change the solver's optimization scope: it remains a
+deterministic relax-and-fix heuristic for one fixed sparse lattice-QP. Use
+`solve_lattice_qp` when a one-shot call is sufficient, and use a session when
+repeated solves share the same `H`, integer coordinates, lattice steps, and
+block structure.
+
 Selection and lattice projection are independent. Typed policies make that
 choice explicit while the original string options remain supported:
 

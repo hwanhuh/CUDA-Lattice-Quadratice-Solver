@@ -7,10 +7,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace lattice_qp {
+
+class CudaSystem;
 
 struct SolverInput {
     std::vector<std::int32_t> rowOffsets;
@@ -59,5 +63,45 @@ struct SolverOutput {
 
 SolverOutput solveLatticeQp(const SolverInput& input,
     const SolverOptions& options);
+
+struct PreparedCudaSolverStats {
+    std::size_t solveCalls = 0;
+    std::size_t cudaSystemCreations = 0;
+    std::size_t cudaSystemReuses = 0;
+};
+
+// Owns the immutable CSR analysis, block-Jacobi preconditioner, CUDA matrix,
+// and PCG work buffers used by a family of solves with the same structure.
+// Per-solve projected state is fully initialized by solve(), so fixed masks,
+// RHS deltas, and iterates never leak between public calls.
+class PreparedCudaSolver final {
+public:
+    explicit PreparedCudaSolver(SolverInput structuralInput);
+    ~PreparedCudaSolver();
+
+    PreparedCudaSolver(const PreparedCudaSolver&) = delete;
+    PreparedCudaSolver& operator=(const PreparedCudaSolver&) = delete;
+    PreparedCudaSolver(PreparedCudaSolver&&) = delete;
+    PreparedCudaSolver& operator=(PreparedCudaSolver&&) = delete;
+
+    SolverOutput solve(std::vector<double> linear,
+        std::vector<double> initial,
+        std::vector<std::int32_t> incidenceIndptr,
+        std::vector<std::int32_t> incidenceIndices,
+        std::vector<std::int64_t> incidenceCoefficients,
+        std::vector<std::int64_t> baseCones,
+        std::vector<std::int64_t> minimumCones,
+        const SolverOptions& options);
+
+    PreparedCudaSolverStats stats() const;
+    void resetStats();
+
+private:
+    SolverInput input_;
+    std::unique_ptr<CudaSystem> system_;
+    mutable std::mutex solveMutex_;
+    std::size_t lifetimeSolveCalls_ = 0;
+    PreparedCudaSolverStats stats_ { 0, 1, 0 };
+};
 
 } // namespace lattice_qp

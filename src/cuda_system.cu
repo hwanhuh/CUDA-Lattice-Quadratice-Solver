@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 namespace lattice_qp {
 namespace {
 
@@ -77,6 +81,9 @@ public:
                   ? std::accumulate(analysis_.values().begin(),
                         analysis_.values().end(), 0.0)
                   : 0.0)
+#if defined(__unix__) || defined(__APPLE__)
+          , creatorProcess_(::getpid())
+#endif
     {
         try {
             allocateDevice();
@@ -476,6 +483,14 @@ private:
 
     void destroy() noexcept
     {
+#if defined(__unix__) || defined(__APPLE__)
+        // CUDA contexts are not fork-safe. If Python drops an inherited
+        // session in a child, avoid calling CUDA teardown APIs against the
+        // parent's copied context. The child process will reclaim its copied
+        // address space normally at exit.
+        if (::getpid() != creatorProcess_)
+            return;
+#endif
         if (stream_ != nullptr)
             cudaStreamSynchronize(stream_);
         if (vectorMatrixDirection_ != nullptr)
@@ -554,6 +569,9 @@ private:
     void* spmvBuffer_ = nullptr;
     std::size_t spmvBufferBytes_ = 0;
     bool projectedStateReady_ = false;
+#if defined(__unix__) || defined(__APPLE__)
+    pid_t creatorProcess_ = 0;
+#endif
 };
 
 

@@ -9,7 +9,7 @@ import numpy as np
 from scipy import sparse
 
 from ._cpu import solve_cpu
-from ._problem import normalize_problem
+from ._problem import NormalizedProblem, normalize_problem
 from ._result import LatticeQPResult
 from ._rounding import resolve_rounding
 from .policies import ConeRoundingPolicy, RoundingPolicy
@@ -29,34 +29,17 @@ def _bounded_integer(value: object, name: str, upper: int) -> int:
     return converted
 
 
-def solve_lattice_qp(
-    H: sparse.spmatrix,
-    g: np.ndarray,
+def _validate_runtime_options(
     *,
-    integer_indices: np.ndarray,
-    lattice_steps: np.ndarray | float = 1.0,
-    x0: np.ndarray | None = None,
-    rounding: str | RoundingPolicy | ConeRoundingPolicy = "multiple",
-    final_solve: Literal["pcg", "none"] = "pcg",
-    block_pairs: np.ndarray | None = None,
-    backend: Literal["auto", "cuda", "cpu"] = "auto",
-    tolerance: float = 2.0e-6,
-    maximum_iterations: int = 20_000,
-    intermediate_tolerance: float = 1.0e-3,
-    intermediate_maximum_iterations: int = 50,
-    multiple_rounding_threshold: float = 0.5,
-    pcg_check_interval: int = 4,
-    check_symmetry: bool = True,
-) -> LatticeQPResult:
-    """Solve a sparse convex lattice QP with deterministic relax-and-fix.
-
-    The problem contract is ``min 0.5*x.T@H@x - g.T@x`` with selected
-    coordinates constrained to ``x[i] in lattice_steps[i] * Z``. ``H`` must
-    be symmetric positive semidefinite and the continuous/projected systems
-    must be bounded. Equality constraints must already have been eliminated.
-    This is a feasible multiple-rounding heuristic, not an exact MIQP solver.
-    """
-
+    final_solve: str,
+    backend: str,
+    tolerance: float,
+    maximum_iterations: int,
+    intermediate_tolerance: float,
+    intermediate_maximum_iterations: int,
+    multiple_rounding_threshold: float,
+    pcg_check_interval: int,
+) -> tuple[int, int, int]:
     if final_solve not in {"pcg", "none"}:
         raise ValueError("final_solve must be 'pcg' or 'none'")
     if backend not in {"auto", "cuda", "cpu"}:
@@ -79,33 +62,70 @@ def solve_lattice_qp(
     pcg_check_interval = _bounded_integer(
         pcg_check_interval, "pcg_check_interval", 64
     )
+    return maximum_iterations, intermediate_maximum_iterations, pcg_check_interval
 
-    problem = normalize_problem(
-        H,
-        g,
-        integer_indices,
-        lattice_steps,
-        x0,
-        block_pairs,
-        check_symmetry=check_symmetry,
+
+def _problem_with_vectors(
+    template: NormalizedProblem, g: np.ndarray, x0: np.ndarray | None
+) -> NormalizedProblem:
+    """Attach per-call vectors to a session's immutable normalized structure."""
+
+    linear = np.ascontiguousarray(np.asarray(g, dtype=np.float64).reshape(-1))
+    if linear.shape != (template.H.shape[0],) or not np.isfinite(linear).all():
+        raise ValueError("g must be a finite vector matching H")
+    initial = (
+        np.zeros(template.H.shape[0], dtype=np.float64)
+        if x0 is None
+        else np.asarray(x0, dtype=np.float64).reshape(-1)
     )
+    initial = np.ascontiguousarray(initial)
+    if initial.shape != linear.shape or not np.isfinite(initial).all():
+        raise ValueError("x0 must be a finite vector matching H")
+    return NormalizedProblem(
+        template.H,
+        linear,
+        template.integer_indices,
+        template.lattice_steps,
+        initial,
+        template.block_pairs,
+    )
+
+
+_ONE_SHOT_CUDA = object()
+
+
+def _solve_normalized_problem(
+    problem: NormalizedProblem,
+    *,
+    rounding: str | RoundingPolicy | ConeRoundingPolicy,
+    final_solve: str,
+    backend: str,
+    tolerance: float,
+    maximum_iterations: int,
+    intermediate_tolerance: float,
+    intermediate_maximum_iterations: int,
+    multiple_rounding_threshold: float,
+    pcg_check_interval: int,
+    prepared_cuda: object = _ONE_SHOT_CUDA,
+    native_error: Exception | None = None,
+    started: float | None = None,
+) -> LatticeQPResult:
     resolved_rounding = resolve_rounding(
         rounding, multiple_rounding_threshold, len(problem.integer_indices)
     )
-    started = perf_counter()
+    if started is None:
+        started = perf_counter()
     selected_backend = backend
-    native_error: Exception | None = None
-    if backend in {"auto", "cuda"} and _core is not None:
+    if (
+        backend in {"auto", "cuda"}
+        and _core is not None
+        and prepared_cuda is not None
+        and native_error is None
+    ):
         try:
-            native = _core.solve_cuda(
-                np.asarray(problem.H.indptr, dtype=np.int32),
-                np.asarray(problem.H.indices, dtype=np.int32),
-                np.asarray(problem.H.data, dtype=np.float64),
+            common_arguments = (
                 problem.g,
-                problem.integer_indices,
-                problem.lattice_steps,
                 problem.x0,
-                problem.block_pairs,
                 resolved_rounding.selection,
                 resolved_rounding.projection,
                 final_solve,
@@ -121,6 +141,20 @@ def solve_lattice_qp(
                 resolved_rounding.base_cones,
                 resolved_rounding.minimum_cones,
             )
+            if prepared_cuda is _ONE_SHOT_CUDA:
+                native = _core.solve_cuda(
+                    np.asarray(problem.H.indptr, dtype=np.int32),
+                    np.asarray(problem.H.indices, dtype=np.int32),
+                    np.asarray(problem.H.data, dtype=np.float64),
+                    common_arguments[0],
+                    problem.integer_indices,
+                    problem.lattice_steps,
+                    common_arguments[1],
+                    problem.block_pairs,
+                    *common_arguments[2:],
+                )
+            else:
+                native = prepared_cuda.solve(*common_arguments)
             selected_backend = "cuda"
         except ValueError:
             raise
@@ -129,6 +163,8 @@ def solve_lattice_qp(
             if backend == "cuda":
                 raise
     elif backend == "cuda":
+        if native_error is not None:
+            raise native_error
         raise RuntimeError("lattice_qp CUDA extension is not installed")
 
     if selected_backend == "cuda":
@@ -168,7 +204,9 @@ def solve_lattice_qp(
         selected_backend = "cpu" if native_error is None else "cpu_fallback"
 
     solution = np.ascontiguousarray(np.asarray(native["x"], dtype=np.float64))
-    relaxation = np.ascontiguousarray(np.asarray(native["relaxation_x"], dtype=np.float64))
+    relaxation = np.ascontiguousarray(
+        np.asarray(native["relaxation_x"], dtype=np.float64)
+    )
     integrality = problem.integrality_residual(solution)
     relaxation_residual = problem.relaxation_residual(relaxation)
     final_residual = problem.projected_residual(solution)
@@ -200,6 +238,69 @@ def solve_lattice_qp(
         cone_violations=np.ascontiguousarray(
             np.asarray(native.get("cone_violations", []), dtype=np.int64)
         ),
+    )
+
+
+def solve_lattice_qp(
+    H: sparse.spmatrix,
+    g: np.ndarray,
+    *,
+    integer_indices: np.ndarray,
+    lattice_steps: np.ndarray | float = 1.0,
+    x0: np.ndarray | None = None,
+    rounding: str | RoundingPolicy | ConeRoundingPolicy = "multiple",
+    final_solve: Literal["pcg", "none"] = "pcg",
+    block_pairs: np.ndarray | None = None,
+    backend: Literal["auto", "cuda", "cpu"] = "auto",
+    tolerance: float = 2.0e-6,
+    maximum_iterations: int = 20_000,
+    intermediate_tolerance: float = 1.0e-3,
+    intermediate_maximum_iterations: int = 50,
+    multiple_rounding_threshold: float = 0.5,
+    pcg_check_interval: int = 4,
+    check_symmetry: bool = True,
+) -> LatticeQPResult:
+    """Solve a sparse convex lattice QP with deterministic relax-and-fix.
+
+    The problem contract is ``min 0.5*x.T@H@x - g.T@x`` with selected
+    coordinates constrained to ``x[i] in lattice_steps[i] * Z``. ``H`` must
+    be symmetric positive semidefinite and the continuous/projected systems
+    must be bounded. Equality constraints must already have been eliminated.
+    This is a feasible multiple-rounding heuristic, not an exact MIQP solver.
+    """
+
+    maximum_iterations, intermediate_maximum_iterations, pcg_check_interval = (
+        _validate_runtime_options(
+            final_solve=final_solve,
+            backend=backend,
+            tolerance=tolerance,
+            maximum_iterations=maximum_iterations,
+            intermediate_tolerance=intermediate_tolerance,
+            intermediate_maximum_iterations=intermediate_maximum_iterations,
+            multiple_rounding_threshold=multiple_rounding_threshold,
+            pcg_check_interval=pcg_check_interval,
+        )
+    )
+    problem = normalize_problem(
+        H,
+        g,
+        integer_indices,
+        lattice_steps,
+        x0,
+        block_pairs,
+        check_symmetry=check_symmetry,
+    )
+    return _solve_normalized_problem(
+        problem,
+        rounding=rounding,
+        final_solve=final_solve,
+        backend=backend,
+        tolerance=tolerance,
+        maximum_iterations=maximum_iterations,
+        intermediate_tolerance=intermediate_tolerance,
+        intermediate_maximum_iterations=intermediate_maximum_iterations,
+        multiple_rounding_threshold=multiple_rounding_threshold,
+        pcg_check_interval=pcg_check_interval,
     )
 
 
